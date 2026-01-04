@@ -34,6 +34,8 @@ from torch.distributed import init_process_group, destroy_process_group
 from torch.distributed.optim import ZeroRedundancyOptimizer
 import torch.distributed as dist
 
+torch.set_default_dtype(torch.float16)
+
 # -----------------------------------------------------------------------------
 # PyTorch nn.Module definitions for the GPT-2 model
 
@@ -51,9 +53,9 @@ class CausalSelfAttention(nn.Module):
         super().__init__()
         assert config.n_embd % config.n_head == 0
         # key, query, value projections for all heads, but in a batch
-        self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd)
+        self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=False)
         # output projection
-        self.c_proj = nn.Linear(config.n_embd, config.n_embd)
+        self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=False)
         self.c_proj.LLMC_RESIDUAL_SCALE_FLAG = 1
         # regularization
         self.n_head = config.n_head
@@ -89,9 +91,9 @@ class MLP(nn.Module):
 
     def __init__(self, config):
         super().__init__()
-        self.c_fc    = nn.Linear(config.n_embd, 4 * config.n_embd)
+        self.c_fc    = nn.Linear(config.n_embd, 4 * config.n_embd, bias=False)
         self.gelu    = NewGELU()
-        self.c_proj  = nn.Linear(4 * config.n_embd, config.n_embd)
+        self.c_proj  = nn.Linear(4 * config.n_embd, config.n_embd, bias=False)
         self.c_proj.LLMC_RESIDUAL_SCALE_FLAG = 1
 
     def forward(self, x):
@@ -110,8 +112,8 @@ class Block(nn.Module):
         self.mlp = MLP(config)
 
     def forward(self, x):
-        x = x + self.attn(self.ln_1(x))
-        x = x + self.mlp(self.ln_2(x))
+        #x = x + self.attn(self.ln_1(x))
+        #x = x + self.mlp(self.ln_2(x))
         return x
 
 # -----------------------------------------------------------------------------
@@ -120,7 +122,7 @@ class Block(nn.Module):
 @dataclass
 class GPTConfig:
     block_size: int = 1024
-    vocab_size: int = 50257
+    vocab_size: int = 8192
     n_layer: int = 12
     n_head: int = 12
     n_embd: int = 768
@@ -157,7 +159,7 @@ class GPT(nn.Module):
             if module.bias is not None:
                 torch.nn.init.zeros_(module.bias)
         elif isinstance(module, nn.Embedding):
-            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02, generator=self.init_rng)
+            torch.nn.init.constant_(module.weight, 0.1)
 
     def forward(self, idx, targets=None, return_logits=True):
         device = idx.device
@@ -168,26 +170,31 @@ class GPT(nn.Module):
         # forward the GPT model itself
         tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
         pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
-        x = tok_emb + pos_emb
+        x = tok_emb# + pos_emb
+        x.retain_grad()
 
-        for block in self.transformer.h:
-            x = block(x)
-        x = self.transformer.ln_f(x)
+        #for block in self.transformer.h:
+        #    x = block(x)
+        #x = self.transformer.ln_f(x)
 
         if targets is not None:
             # if we are given some desired targets also calculate the loss
             logits = self.lm_head(x)
+            #logits = torch.ones_like(logits)  # dummy logits for gradient inspection
+            #logits.requires_grad = True
+            logits.retain_grad()  # retain gradient for inspection
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
         else:
             # inference-time mini-optimization: only forward the lm_head on the very last position
             logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
             loss = None
 
+        #logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
         # there are performance reasons why not returning logits is prudent, if not needed
         if not return_logits:
             logits = None
 
-        return logits, loss
+        return x, logits, loss
 
     @classmethod
     def from_pretrained(cls, model_type):
@@ -198,7 +205,7 @@ class GPT(nn.Module):
 
         # n_layer, n_head and n_embd are determined from model_type
         config_args = {
-            'gpt2':         dict(n_layer=12, n_head=12, n_embd=768),  # 124M params
+            'gpt2':         dict(n_layer=6, n_head=8, n_embd=256),  # 124M params
             'gpt2-medium':  dict(n_layer=24, n_head=16, n_embd=1024), # 350M params
             'gpt2-large':   dict(n_layer=36, n_head=20, n_embd=1280), # 774M params
             'gpt2-xl':      dict(n_layer=48, n_head=25, n_embd=1600), # 1558M params
@@ -377,6 +384,112 @@ class DistributedDataLoader:
             self.advance()
         return x, y
 
+class DebugDataLoader:
+    """Simple debug data loader that generates arithmetic sequences instead of random data"""
+    def __init__(self, B, T, process_rank, num_processes, vocab_size=50257):
+        self.process_rank = process_rank
+        self.num_processes = num_processes
+        self.B = B
+        self.T = T
+        self.vocab_size = vocab_size
+        self.counter = 0
+        print0(f"DebugDataLoader: generating arithmetic sequences (B={B}, T={T}, vocab_size={vocab_size})")
+
+    def reset(self):
+        self.counter = 0
+
+    def advance(self):
+        pass  # no-op for debug loader
+
+    def next_batch(self):
+        B = self.B
+        T = self.T
+        # Generate arithmetic sequences starting from counter
+        x = torch.zeros(B, T, dtype=torch.long)
+        y = torch.zeros(B, T, dtype=torch.long)
+        
+        for b in range(B):
+            for t in range(T):
+                # Generate arithmetic sequence: each token is (counter + offset) % vocab_size
+                #offset = b * T + t
+                offset = t
+                x[b, t] = offset
+                y[b, t] = offset + 1
+        
+        self.counter += B * T * self.num_processes
+        return x, y
+
+class TextDataLoader:
+    """
+    Data loader that reads token IDs from text files (space-separated integers).
+    Implements random window sampling matching the C++ version behavior.
+    """
+    def __init__(self, filename, B, T, process_rank=0, num_processes=1):
+        self.process_rank = process_rank
+        self.num_processes = num_processes
+        self.B = B
+        self.T = T
+        
+        # Read the text file with space-separated token IDs
+        print0(f"TextDataLoader: reading {filename}")
+        with open(filename, 'r') as f:
+            content = f.read()
+        
+        # Parse space-separated integers
+        token_ids = [int(token) for token in content.split() if token.strip()]
+        self.dataset = np.array(token_ids, dtype=np.uint32)
+        
+        print0(f"TextDataLoader: loaded {len(self.dataset):,} tokens from {filename}")
+        
+        # Check if dataset is large enough
+        self.is_too_small = len(self.dataset) <= T
+        if self.is_too_small:
+            print0(f"WARNING: Dataset has only {len(self.dataset)} tokens, which is <= sequence_length ({T}). Will return zero-padded batches.")
+        
+        # Initialize random number generator
+        self.rng = np.random.RandomState(42 + process_rank)
+    
+    def reset(self):
+        # Reset random state to initial seed
+        self.rng = np.random.RandomState(42 + self.process_rank)
+    
+    def advance(self):
+        pass  # no-op for text loader (no sharding)
+    
+    def next_batch(self):
+        """
+        Sample random windows from the dataset.
+        Returns:
+            x: input tokens [B, T] - tokens[start:start+T]
+            y: target tokens [B, T] - tokens[start+1:start+T+1] (next-token prediction)
+        """
+        B = self.B
+        T = self.T
+        
+        x = np.zeros((B, T), dtype=np.int32)
+        y = np.zeros((B, T), dtype=np.int32)
+        
+        # If dataset is too small, return zero-padded tensors
+        if self.is_too_small:
+            return torch.from_numpy(x).long(), torch.from_numpy(y).long()
+        
+        # Sample random windows for each batch element
+        # Valid start positions: [0, len(dataset) - T - 2]
+        # We need T tokens for input and T tokens for targets (which start at position start+1)
+        # So we need at least start + T + 1 <= len(dataset), i.e., start <= len(dataset) - T - 1
+        max_start = len(self.dataset) - T - 2
+        
+        for b in range(B):
+            start = self.rng.randint(0, max_start + 1)  # randint is [low, high)
+
+            # Input: tokens[start:start+T]
+            x[b] = self.dataset[start:start + T]
+            
+            # Targets: tokens[start+1:start+T+1] (next-token prediction)
+            y[b] = self.dataset[start + 1:start + T + 1]
+        
+        return torch.from_numpy(x).long(), torch.from_numpy(y).long()
+
 # -----------------------------------------------------------------------------
 # Python -> C bridge utilities for saving params/grads/activations to .bin files
 
@@ -544,14 +657,15 @@ if __name__ == "__main__":
     # file system input / output
     parser.add_argument("--input_bin", type=str, default="dev/data/tinyshakespeare/tiny_shakespeare_val.bin", help="input .bin to train on")
     parser.add_argument("--input_val_bin", type=str, default="", help="input .bin to eval validation loss on")
+    parser.add_argument("--input_txt", type=str, default="", help="input .txt file with space-separated token IDs")
     parser.add_argument("--output_dir", type=str, default="", help="output directory to which to write logs and checkpoints")
-    parser.add_argument("--model", type=str, default="gpt2", help="gpt2|gpt2-medium|gpt2-large|gpt2-xl|d12|d24|d36|d48")
+    parser.add_argument("--model", type=str, default="d12", help="gpt2|gpt2-medium|gpt2-large|gpt2-xl|d12|d24|d36|d48")
     # token layout for each step of the optimization
     parser.add_argument("--batch_size", type=int, default=4, help="batch size, in units of #batch dimensions")
     parser.add_argument("--sequence_length", type=int, default=64, help="sequence length")
     parser.add_argument("--total_batch_size", type=int, default=256, help="total desired batch size, in units of #tokens")
     # workload (number of steps)
-    parser.add_argument("--num_iterations", type=int, default=10, help="number of iterations to run")
+    parser.add_argument("--num_iterations", type=int, default=10000, help="number of iterations to run")
     parser.add_argument("--inference_only", type=int, default=0, help="only run inference")
     # optimization
     parser.add_argument("--learning_rate", type=float, default=1e-4, help="learning rate warmup iterations")
@@ -565,13 +679,14 @@ if __name__ == "__main__":
     parser.add_argument("--sample_every", type=int, default=0, help="how often to sample from the model?")
     # debugging
     parser.add_argument("--overfit_single_batch", type=int, default=1, help="overfit just one batch of data")
+    parser.add_argument("--debug_loader", type=int, default=1, help="use debug data loader with arithmetic sequences instead of random data")
     # numerics
     parser.add_argument("--tensorcores", type=int, default=0, help="use tensorcores")
     # memory management
     parser.add_argument("--device", type=str, default="", help="by default we autodetect, or set it here")
     parser.add_argument("--compile", type=int, default=0, help="torch.compile the model")
     parser.add_argument("--flash", type=int, default=0, help="use flash attention")
-    parser.add_argument("--dtype", type=str, default="float32", help="float32|float16|bfloat16")
+    parser.add_argument("--dtype", type=str, default="float16", help="float32|float16|bfloat16")
     parser.add_argument("--zero_stage", type=int, default=0, help="zero redundancy optimizer stage (0/1/2/3)")
     # python -> C bridge
     parser.add_argument("--write_tensors", type=int, default=1, help="write tensors to disk")
@@ -652,7 +767,7 @@ if __name__ == "__main__":
     if args.model[0] == "d":
         # from scratch (random weights)
         model_config = {
-            "d12": GPTConfig(block_size=1024, vocab_size=50257, n_layer=12, n_head=12, n_embd=768),
+            "d12": GPTConfig(block_size=64, vocab_size=8192, n_layer=1, n_head=1, n_embd=256),
             "d24": GPTConfig(block_size=1024, vocab_size=50257, n_layer=24, n_head=16, n_embd=1024),
             "d36": GPTConfig(block_size=1024, vocab_size=50257, n_layer=36, n_head=20, n_embd=1280),
             "d48": GPTConfig(block_size=1024, vocab_size=50257, n_layer=48, n_head=25, n_embd=1600),
@@ -673,16 +788,25 @@ if __name__ == "__main__":
     # Our own version of a simple DistributedDataLoader
 
     # load tokens
-    train_loader = DistributedDataLoader(args.input_bin, B, T, ddp_rank, ddp_world_size)
-    val_loader = None
-    if args.input_val_bin:
-        val_loader = DistributedDataLoader(args.input_val_bin, B, T, ddp_rank, ddp_world_size)
+    if args.debug_loader:
+        train_loader = DebugDataLoader(B, T, ddp_rank, ddp_world_size, vocab_size=8192)
+        val_loader = None
+    elif args.input_txt:
+        train_loader = TextDataLoader(args.input_txt, B, T, ddp_rank, ddp_world_size)
+        val_loader = None
+    else:
+        train_loader = DistributedDataLoader(args.input_bin, B, T, ddp_rank, ddp_world_size)
+        val_loader = None
+        if args.input_val_bin:
+            val_loader = DistributedDataLoader(args.input_val_bin, B, T, ddp_rank, ddp_world_size)
+
+    #train_loader = TextDataLoader("shakespeare_tokenized.txt", B, T, ddp_rank, ddp_world_size)
 
     # -------------------------------------------------------------------------
     # PyTorch -> C bridge: save some weights and state for C to load later as reference
 
     # do one forward pass to generate ground truth for our C tests
-    if master_process and args.write_tensors and (not args.inference_only):
+    if False and master_process and args.write_tensors and (not args.inference_only):
         x, y = train_loader.next_batch()
         x, y = x.to(device), y.to(device)
         logits, loss = model(x, y)
@@ -708,9 +832,10 @@ if __name__ == "__main__":
     raw_model = model.module if ddp else model # always contains the "raw" unwrapped model
 
     # init the optimizer
-    optimizer = raw_model.configure_optimizers(weight_decay=args.weight_decay,
-                                               learning_rate=args.learning_rate, betas=(0.9, 0.95),
-                                               device_type=device, zero_stage=zero_stage)
+    #optimizer = raw_model.configure_optimizers(weight_decay=args.weight_decay,
+    #                                           learning_rate=args.learning_rate, betas=(0.9, 0.95),
+    #                                           device_type=device, zero_stage=zero_stage)
+    optimizer = torch.optim.Adam(lr=args.learning_rate, params=raw_model.parameters())
 
     # learning rate decay scheduler (cosine with warmup)
     def get_lr(it):
@@ -807,7 +932,7 @@ if __name__ == "__main__":
                 model.require_backward_grad_sync = (micro_step == grad_accum_steps - 1)
             # forward pass
             with ctx:
-                _, loss = model(x, y, return_logits=False)
+                tmp, logits, loss = model(x, y, return_logits=True)
                 # we have to scale the loss to account for gradient accumulation,
                 # because the gradients just add on each successive backward().
                 # addition of gradients corresponds to a SUM in the objective, but
@@ -817,10 +942,21 @@ if __name__ == "__main__":
             # backward pass
             if not args.inference_only:
                 loss.backward()
+                tmp2 = logits.grad @ raw_model.lm_head.weight
+                # inspect gradient of loss w.r.t. lm_head output (logits)
+                if micro_step == grad_accum_steps - 1 and step == 0 and logits is not None:
+                    print0(f"\n=== Gradient w.r.t. logits (lm_head output) ===")
+                #    print0(f"Logits shape: {logits.shape}")
+                #    print0(f"Logits gradient shape: {logits.grad.shape}")
+                #    print0(f"Logits gradient norm: {logits.grad.norm():.6f}")
+                #    print0(f"Logits gradient stats: min={logits.grad.min():.6f}, max={logits.grad.max():.6f}, mean={logits.grad.mean():.6f}")
+                #    print0(f"Logits gradient std: {logits.grad.std():.6f}")
+                #    print0(f"==============================================\n")
         if ddp:
             dist.all_reduce(lossf, op=dist.ReduceOp.AVG)
         lossf = lossf.item()
-        norm = torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+        #norm = torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+        norm = 0.0
         # determine and set the learning rate for this iteration
         lr = get_lr(step)
         for param_group in optimizer.param_groups:
