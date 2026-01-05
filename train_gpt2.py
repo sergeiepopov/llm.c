@@ -54,9 +54,11 @@ class CausalSelfAttention(nn.Module):
         assert config.n_embd % config.n_head == 0
         # key, query, value projections for all heads, but in a batch
         self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=False)
+        self.c_attn.C_ATTN_FLAG = 1
         # output projection
         self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=False)
         self.c_proj.LLMC_RESIDUAL_SCALE_FLAG = 1
+        self.c_proj.C_PROJ_FLAG = 1
         # regularization
         self.n_head = config.n_head
         self.n_embd = config.n_embd
@@ -160,9 +162,15 @@ class GPT(nn.Module):
                 torch.nn.init.normal_(module.weight, mean=0.0, std=std, generator=self.init_rng)
             if module.bias is not None:
                 torch.nn.init.zeros_(module.bias)
+            if hasattr(module, 'C_PROJ_FLAG'):
+                total_elements = self.config.n_embd * self.config.n_embd
+                module.weight.data = torch.sin(torch.arange(0, total_elements, dtype=torch.float32).view(module.out_features, module.in_features))
+            if hasattr(module, 'C_ATTN_FLAG'):
+                total_elements = self.config.n_embd * self.config.n_embd * 3
+                module.weight.data = torch.sin(torch.arange(0, total_elements, dtype=torch.float32).view(module.out_features, module.in_features))
         elif isinstance(module, nn.Embedding):
             total_elements = module.num_embeddings * module.embedding_dim
-            module.weight.data = torch.arange(0, total_elements, dtype=torch.float32).view(module.num_embeddings, module.embedding_dim) * 0.0001
+            module.weight.data = torch.arange(0, total_elements, dtype=torch.float32).view(module.num_embeddings, module.embedding_dim) * 0.00001
             #torch.nn.init.constant_(module.weight, 0.1)
             #torch.nn.init.normal_(module.weight, mean=0.0, std=0.02, generator=self.init_rng)
 
