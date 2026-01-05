@@ -34,7 +34,7 @@ from torch.distributed import init_process_group, destroy_process_group
 from torch.distributed.optim import ZeroRedundancyOptimizer
 import torch.distributed as dist
 
-torch.set_default_dtype(torch.float16)
+#torch.set_default_dtype(torch.float16)
 
 # -----------------------------------------------------------------------------
 # PyTorch nn.Module definitions for the GPT-2 model
@@ -114,6 +114,7 @@ class Block(nn.Module):
     def forward(self, x):
         #x = x + self.attn(self.ln_1(x))
         #x = x + self.mlp(self.ln_2(x))
+        x = self.attn(x)
         return x
 
 # -----------------------------------------------------------------------------
@@ -159,7 +160,10 @@ class GPT(nn.Module):
             if module.bias is not None:
                 torch.nn.init.zeros_(module.bias)
         elif isinstance(module, nn.Embedding):
-            torch.nn.init.constant_(module.weight, 0.1)
+            #total_elements = module.num_embeddings * module.embedding_dim
+            #module.weight.data = torch.arange(0, total_elements, dtype=torch.float32).view(module.num_embeddings, module.embedding_dim) * 0.0001
+            #torch.nn.init.constant_(module.weight, 0.1)
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02, generator=self.init_rng)
 
     def forward(self, idx, targets=None, return_logits=True):
         device = idx.device
@@ -170,19 +174,23 @@ class GPT(nn.Module):
         # forward the GPT model itself
         tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
         pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
-        x = tok_emb# + pos_emb
-        x.retain_grad()
+        x = tok_emb + pos_emb
+        #x.retain_grad()
 
-        #for block in self.transformer.h:
-        #    x = block(x)
+        for block in self.transformer.h:
+            x = block(x)
         #x = self.transformer.ln_f(x)
 
         if targets is not None:
             # if we are given some desired targets also calculate the loss
+            #x = torch.arange(0, b*t*self.config.n_embd, dtype=torch.float32, device=device).view(b, t, self.config.n_embd) * 0.0001
+            #wtmp = self.lm_head.weight.T.detach()
             logits = self.lm_head(x)
+            #logits = x.view(256, 256) @ wtmp
+            #tmp3 = torch.all(logits == self.lm_head(x).view(256, 8192))
             #logits = torch.ones_like(logits)  # dummy logits for gradient inspection
             #logits.requires_grad = True
-            logits.retain_grad()  # retain gradient for inspection
+            logits.retain_grad()
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
         else:
             # inference-time mini-optimization: only forward the lm_head on the very last position
@@ -665,7 +673,7 @@ if __name__ == "__main__":
     parser.add_argument("--sequence_length", type=int, default=64, help="sequence length")
     parser.add_argument("--total_batch_size", type=int, default=256, help="total desired batch size, in units of #tokens")
     # workload (number of steps)
-    parser.add_argument("--num_iterations", type=int, default=10000, help="number of iterations to run")
+    parser.add_argument("--num_iterations", type=int, default=100000000, help="number of iterations to run")
     parser.add_argument("--inference_only", type=int, default=0, help="only run inference")
     # optimization
     parser.add_argument("--learning_rate", type=float, default=1e-4, help="learning rate warmup iterations")
@@ -678,8 +686,8 @@ if __name__ == "__main__":
     parser.add_argument("--val_max_steps", type=int, default=20, help="how many batches of val to average?")
     parser.add_argument("--sample_every", type=int, default=0, help="how often to sample from the model?")
     # debugging
-    parser.add_argument("--overfit_single_batch", type=int, default=1, help="overfit just one batch of data")
-    parser.add_argument("--debug_loader", type=int, default=1, help="use debug data loader with arithmetic sequences instead of random data")
+    parser.add_argument("--overfit_single_batch", type=int, default=0, help="overfit just one batch of data")
+    parser.add_argument("--debug_loader", type=int, default=0, help="use debug data loader with arithmetic sequences instead of random data")
     # numerics
     parser.add_argument("--tensorcores", type=int, default=0, help="use tensorcores")
     # memory management
@@ -800,7 +808,7 @@ if __name__ == "__main__":
         if args.input_val_bin:
             val_loader = DistributedDataLoader(args.input_val_bin, B, T, ddp_rank, ddp_world_size)
 
-    #train_loader = TextDataLoader("shakespeare_tokenized.txt", B, T, ddp_rank, ddp_world_size)
+    train_loader = TextDataLoader("shakespeare_tokenized.txt", B, T, ddp_rank, ddp_world_size)
 
     # -------------------------------------------------------------------------
     # PyTorch -> C bridge: save some weights and state for C to load later as reference
@@ -942,10 +950,20 @@ if __name__ == "__main__":
             # backward pass
             if not args.inference_only:
                 loss.backward()
-                tmp2 = logits.grad @ raw_model.lm_head.weight
+                wte_grad = model.transformer.wte.weight.grad
+                
+                # Manual gradient computation - ensure consistent dtype
+                tmp3 = (logits.grad.view(256, 8192).to(dtype=torch.float32).T @ 
+                        tmp.view(256, 256).to(dtype=torch.float32))
+                wte_grad_fp32 = wte_grad.to(dtype=torch.float32)
+                
+                # Use appropriate tolerances (default rtol=1e-5, atol=1e-8 might be too strict)
+                tmp4 = torch.allclose(wte_grad_fp32, tmp3, rtol=1e-4, atol=1e-6)
+                #breakpoint()
+                #tmp2 = logits.grad @ raw_model.lm_head.weight
                 # inspect gradient of loss w.r.t. lm_head output (logits)
-                if micro_step == grad_accum_steps - 1 and step == 0 and logits is not None:
-                    print0(f"\n=== Gradient w.r.t. logits (lm_head output) ===")
+                #if micro_step == grad_accum_steps - 1 and step == 0 and logits is not None:
+                #    print0(f"\n=== Gradient w.r.t. logits (lm_head output) ===")
                 #    print0(f"Logits shape: {logits.shape}")
                 #    print0(f"Logits gradient shape: {logits.grad.shape}")
                 #    print0(f"Logits gradient norm: {logits.grad.norm():.6f}")
