@@ -67,27 +67,28 @@ class CausalSelfAttention(nn.Module):
                                      .view(1, 1, config.block_size, config.block_size))
 
     def forward(self, x):
-        B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
-        # calculate query, key, values for all heads in batch and move head forward to be the batch dim
-        qkv = self.c_attn(x)
-        q, k, v = qkv.split(self.n_embd, dim=2)
-        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-        v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-        if FLASH:
-            # flashattention
-            y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
-        else:
-            # manual implementation of attention
-            # this materializes the large (T,T) matrix for all the queries and keys
-            att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-            att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
-            att = F.softmax(att, dim=-1)
-            y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
-        y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
-        # output projection
-        y = self.c_proj(y)
-        return y
+        #B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
+        ## calculate query, key, values for all heads in batch and move head forward to be the batch dim
+        #qkv = self.c_attn(x)
+        #q, k, v = qkv.split(self.n_embd, dim=2)
+        #k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+        #q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+        #v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+        #if FLASH:
+        #    # flashattention
+        #    y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        #else:
+        #    # manual implementation of attention
+        #    # this materializes the large (T,T) matrix for all the queries and keys
+        #    att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+        #    att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
+        #    att = F.softmax(att, dim=-1)
+        #    y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
+        #y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
+        ## output projection
+        #y = self.c_proj(y)
+        #return y
+        return self.c_proj(x)
 
 class MLP(nn.Module):
 
@@ -163,14 +164,16 @@ class GPT(nn.Module):
             if module.bias is not None:
                 torch.nn.init.zeros_(module.bias)
             if hasattr(module, 'C_PROJ_FLAG'):
-                total_elements = self.config.n_embd * self.config.n_embd
-                module.weight.data = torch.sin(torch.arange(0, total_elements, dtype=torch.float32).view(module.out_features, module.in_features))
+                #total_elements = module.out_features * module.in_features
+                #module.weight.data = torch.linspace(-10.0, 10.0, steps=total_elements).view(module.out_features, module.in_features)
+                torch.nn.init.constant_(module.weight, 0.1)
             if hasattr(module, 'C_ATTN_FLAG'):
-                total_elements = self.config.n_embd * self.config.n_embd * 3
-                module.weight.data = torch.sin(torch.arange(0, total_elements, dtype=torch.float32).view(module.out_features, module.in_features))
+                total_elements = module.out_features * module.in_features
+                module.weight.data = torch.linspace(-10.0, 10.0, steps=total_elements).view(module.out_features, module.in_features)
         elif isinstance(module, nn.Embedding):
             total_elements = module.num_embeddings * module.embedding_dim
-            module.weight.data = torch.arange(0, total_elements, dtype=torch.float32).view(module.num_embeddings, module.embedding_dim) * 0.00001
+            #module.weight.data = torch.arange(0, total_elements, dtype=torch.float32).view(module.num_embeddings, module.embedding_dim) * 0.0001
+            module.weight.data = torch.linspace(-10.0, 10.0, steps=total_elements).view(module.num_embeddings, module.embedding_dim)
             #torch.nn.init.constant_(module.weight, 0.1)
             #torch.nn.init.normal_(module.weight, mean=0.0, std=0.02, generator=self.init_rng)
 
@@ -186,8 +189,8 @@ class GPT(nn.Module):
         x = tok_emb# + pos_emb
         #x.retain_grad()
 
-        for block in self.transformer.h:
-            x = block(x)
+        #for block in self.transformer.h:
+        #    x = block(x)
         #x = self.transformer.ln_f(x)
 
         if targets is not None:
@@ -749,6 +752,7 @@ if __name__ == "__main__":
                 device = "mps"
     print(f"using device: {device}")
     device_type = 'cuda' if 'cuda' in device else 'cpu'
+    #device_type = 'cpu'
 
     # calculate gradient accumulation from the desired total batch size and the current run configuration
     tokens_per_fwdbwd = B * T * ddp_world_size
