@@ -115,6 +115,7 @@ class Block(nn.Module):
         #x = x + self.attn(self.ln_1(x))
         #x = x + self.mlp(self.ln_2(x))
         x = self.attn(x)
+        #x = self.mlp(x)
         return x
 
 # -----------------------------------------------------------------------------
@@ -160,10 +161,10 @@ class GPT(nn.Module):
             if module.bias is not None:
                 torch.nn.init.zeros_(module.bias)
         elif isinstance(module, nn.Embedding):
-            #total_elements = module.num_embeddings * module.embedding_dim
-            #module.weight.data = torch.arange(0, total_elements, dtype=torch.float32).view(module.num_embeddings, module.embedding_dim) * 0.0001
+            total_elements = module.num_embeddings * module.embedding_dim
+            module.weight.data = torch.arange(0, total_elements, dtype=torch.float32).view(module.num_embeddings, module.embedding_dim) * 0.0001
             #torch.nn.init.constant_(module.weight, 0.1)
-            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02, generator=self.init_rng)
+            #torch.nn.init.normal_(module.weight, mean=0.0, std=0.02, generator=self.init_rng)
 
     def forward(self, idx, targets=None, return_logits=True):
         device = idx.device
@@ -174,7 +175,7 @@ class GPT(nn.Module):
         # forward the GPT model itself
         tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
         pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
-        x = tok_emb + pos_emb
+        x = tok_emb# + pos_emb
         #x.retain_grad()
 
         for block in self.transformer.h:
@@ -687,7 +688,7 @@ if __name__ == "__main__":
     parser.add_argument("--sample_every", type=int, default=0, help="how often to sample from the model?")
     # debugging
     parser.add_argument("--overfit_single_batch", type=int, default=0, help="overfit just one batch of data")
-    parser.add_argument("--debug_loader", type=int, default=0, help="use debug data loader with arithmetic sequences instead of random data")
+    parser.add_argument("--debug_loader", type=int, default=1, help="use debug data loader with arithmetic sequences instead of random data")
     # numerics
     parser.add_argument("--tensorcores", type=int, default=0, help="use tensorcores")
     # memory management
@@ -808,7 +809,7 @@ if __name__ == "__main__":
         if args.input_val_bin:
             val_loader = DistributedDataLoader(args.input_val_bin, B, T, ddp_rank, ddp_world_size)
 
-    train_loader = TextDataLoader("shakespeare_tokenized.txt", B, T, ddp_rank, ddp_world_size)
+    #train_loader = TextDataLoader("shakespeare_tokenized.txt", B, T, ddp_rank, ddp_world_size)
 
     # -------------------------------------------------------------------------
     # PyTorch -> C bridge: save some weights and state for C to load later as reference
